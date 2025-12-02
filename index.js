@@ -32,7 +32,7 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
 // --- Supabase client ---
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-// --- Helper: Download auth folder from Supabase only (read-only) ---
+// --- Helper: Download auth folder from Supabase (read-only) ---
 async function downloadAuthFolder(authFolder) {
   try {
     const { data, error } = await supabase.storage.from(BUCKET_NAME).list(`${CLIENT_ID}_auth/`);
@@ -49,7 +49,7 @@ async function downloadAuthFolder(authFolder) {
       const buf = Buffer.from(await fileData.arrayBuffer());
       await fs.writeFile(path.join(authFolder, file.name), buf);
     }
-    console.log("✅ Auth folder downloaded from Supabase");
+    console.log("✅ Auth folder downloaded from Supabase (read-only)");
   } catch (err) {
     console.warn("⚠️ Failed to download auth folder:", err.message);
   }
@@ -68,11 +68,6 @@ async function startBot() {
     logger: pino({ level: "silent" }),
     version,
     auth: state
-  });
-
-  // Save credentials locally only (no upload)
-  sock.ev.on("creds.update", async () => {
-    await saveCreds();
   });
 
   // Connection & QR / reconnect handling
@@ -112,10 +107,16 @@ async function startBot() {
 
       if (!text) continue;
 
-      // Convert personal s.whatsapp.net IDs to c.us
-      if (jid.endsWith("@s.whatsapp.net") && !jid.endsWith("@g.us")) {
-        const phoneNumber = jid.split("@")[0];
-        jid = `${phoneNumber}@c.us`;
+      // --- Normalize personal chats to phoneNumber@c.us ---
+      if (!jid.endsWith("@g.us")) {
+        if (msg.key.senderPn) {
+          const phoneNumber = msg.key.senderPn.split("@")[0];
+          jid = `${phoneNumber}@c.us`;
+        } else if (jid.includes("@s.whatsapp.net")) {
+          jid = jid.replace("@s.whatsapp.net", "@c.us");
+        } else if (jid.includes("@lid")) {
+          jid = jid.replace(/@.*$/, "@c.us");
+        }
       }
 
       console.log(`📩 Message from ${jid}: ${text}`);
@@ -128,12 +129,18 @@ async function startBot() {
             body: JSON.stringify({ from: jid, message: text }),
           });
           let replyData = {};
-          try { replyData = await res.json(); } catch {}
+          try {
+            replyData = await res.json();
+          } catch {}
           if (Array.isArray(replyData)) replyData = replyData[0];
           const reply = replyData?.Reply ?? replyData?.reply;
           if (reply) {
-            await sock.sendMessage(jid, { text: reply });
-            console.log("💬 Reply sent:", reply);
+            // --- Add random delay between 10-20 seconds ---
+            const delay = Math.floor(Math.random() * (20000 - 10000 + 1)) + 10000;
+            setTimeout(async () => {
+              await sock.sendMessage(jid, { text: reply });
+              console.log("💬 Reply sent (delayed):", reply);
+            }, delay);
           }
         } catch (err) {
           console.error("❌ Error calling webhook:", err.message);
