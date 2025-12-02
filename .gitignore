@@ -1,0 +1,15 @@
+# Node modules
+node_modules/
+
+# Logs
+logs
+*.log
+
+# Session / auth info (optional local storage)
+sessions/
+
+# Environment variables
+.env
+
+# npm lock (optional)
+package-lock.json
