@@ -10,7 +10,7 @@ import makeWASocket, {
   DisconnectReason
 } from "@whiskeysockets/baileys";
 
-import pino from "pino";   // <-- ADDED FOR SILENT MODE
+import pino from "pino";   // <-- SILENT MODE ENABLED
 
 import fs from "fs/promises";
 import path from "path";
@@ -32,22 +32,7 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
 // --- Supabase client ---
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-// --- Helper: Sync auth folder to Supabase ---
-async function uploadAuthFolder(authFolder) {
-  try {
-    const files = await fs.readdir(authFolder);
-    for (const file of files) {
-      const filePath = path.join(authFolder, file);
-      const buffer = await fs.readFile(filePath);
-      await supabase.storage.from(BUCKET_NAME)
-        .upload(`${CLIENT_ID}_auth/${file}`, buffer, { upsert: true });
-    }
-    console.log("💾 Auth folder synced to Supabase");
-  } catch (err) {
-    console.error("❌ Failed to upload auth folder:", err.message);
-  }
-}
-
+// --- Helper: Download auth folder from Supabase only (read-only) ---
 async function downloadAuthFolder(authFolder) {
   try {
     const { data, error } = await supabase.storage.from(BUCKET_NAME).list(`${CLIENT_ID}_auth/`);
@@ -80,15 +65,14 @@ async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState(authFolder);
 
   const sock = makeWASocket({
-    logger: pino({ level: "silent" }),  // <-- SILENT MODE ENABLED
+    logger: pino({ level: "silent" }),
     version,
     auth: state
   });
 
-  // Save credentials and sync auth files to Supabase
+  // Save credentials locally only (no upload)
   sock.ev.on("creds.update", async () => {
     await saveCreds();
-    await uploadAuthFolder(authFolder);
   });
 
   // Connection & QR / reconnect handling
@@ -128,8 +112,9 @@ async function startBot() {
 
       if (!text) continue;
 
-      if (msg.key.senderPn && !jid.endsWith("@g.us")) {
-        const phoneNumber = msg.key.senderPn.split("@")[0];
+      // Convert personal s.whatsapp.net IDs to c.us
+      if (jid.endsWith("@s.whatsapp.net") && !jid.endsWith("@g.us")) {
+        const phoneNumber = jid.split("@")[0];
         jid = `${phoneNumber}@c.us`;
       }
 
@@ -143,9 +128,7 @@ async function startBot() {
             body: JSON.stringify({ from: jid, message: text }),
           });
           let replyData = {};
-          try {
-            replyData = await res.json();
-          } catch {}
+          try { replyData = await res.json(); } catch {}
           if (Array.isArray(replyData)) replyData = replyData[0];
           const reply = replyData?.Reply ?? replyData?.reply;
           if (reply) {
