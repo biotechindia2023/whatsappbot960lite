@@ -7,9 +7,11 @@ import { createClient } from "@supabase/supabase-js";
 import makeWASocket, {
   fetchLatestBaileysVersion,
   useMultiFileAuthState,
-  DisconnectReason,
-  useLogger        // <-- ADDED FOR SILENT MODE
+  DisconnectReason
 } from "@whiskeysockets/baileys";
+
+import pino from "pino";   // <-- ADDED FOR SILENT MODE
+
 import fs from "fs/promises";
 import path from "path";
 
@@ -55,10 +57,10 @@ async function downloadAuthFolder(authFolder) {
     }
     await fs.mkdir(authFolder, { recursive: true });
     for (const file of data) {
-      const { data: fileData } = await supabase.storage
+      const { data: fileData, error: downloadErr } = await supabase.storage
         .from(BUCKET_NAME)
         .download(`${CLIENT_ID}_auth/${file.name}`);
-      if (!fileData) continue;
+      if (downloadErr || !fileData) continue;
       const buf = Buffer.from(await fileData.arrayBuffer());
       await fs.writeFile(path.join(authFolder, file.name), buf);
     }
@@ -77,15 +79,13 @@ async function startBot() {
 
   const { state, saveCreds } = await useMultiFileAuthState(authFolder);
 
-  // --- SILENT MODE: disable Baileys internal logs ---
-  const logger = useLogger({ level: "fatal" }); // 🔇 Only fatal errors shown
-
   const sock = makeWASocket({
+    logger: pino({ level: "silent" }),  // <-- SILENT MODE ENABLED
     version,
-    auth: state,
-    logger   // <-- APPLY SILENT MODE
+    auth: state
   });
 
+  // Save credentials and sync auth files to Supabase
   sock.ev.on("creds.update", async () => {
     await saveCreds();
     await uploadAuthFolder(authFolder);
@@ -128,7 +128,6 @@ async function startBot() {
 
       if (!text) continue;
 
-      // Map senderPn → real phone number
       if (msg.key.senderPn && !jid.endsWith("@g.us")) {
         const phoneNumber = msg.key.senderPn.split("@")[0];
         jid = `${phoneNumber}@c.us`;
