@@ -10,7 +10,7 @@ import makeWASocket, {
   DisconnectReason
 } from "@whiskeysockets/baileys";
 
-import pino from "pino"; // silent
+import pino from "pino";
 import fs from "fs/promises";
 import path from "path";
 
@@ -29,46 +29,71 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-// ---------------- Download session (read-only start) ----------------
+// ----------------------------
+// DOWNLOAD SESSION ON START
+// ----------------------------
 async function downloadAuthFolder(authFolder) {
   try {
-    const { data } = await supabase.storage.from(BUCKET_NAME).list(`${CLIENT_ID}_auth/`);
-    if (!data || data.length === 0) return console.log("ℹ️ No auth session found – new login");
+    const { data, error } = await supabase.storage
+      .from(BUCKET_NAME)
+      .list(`${CLIENT_ID}_auth/`);
+
+    if (error || !data || data.length === 0) {
+      console.log("ℹ️ No previous session found. Fresh login needed.");
+      return;
+    }
 
     await fs.mkdir(authFolder, { recursive: true });
 
-    for (const f of data) {
-      const { data: file } = await supabase.storage
+    for (const file of data) {
+      const { data: fileData } = await supabase.storage
         .from(BUCKET_NAME)
-        .download(`${CLIENT_ID}_auth/${f.name}`);
+        .download(`${CLIENT_ID}_auth/${file.name}`);
 
-      if (!file) continue;
-      const buf = Buffer.from(await file.arrayBuffer());
-      await fs.writeFile(path.join(authFolder, f.name), buf);
+      if (!fileData) continue;
+
+      const buf = Buffer.from(await fileData.arrayBuffer());
+      await fs.writeFile(path.join(authFolder, file.name), buf);
     }
+
     console.log("✅ Session loaded (read-only start mode)");
   } catch (err) {
-    console.log("⚠️ Could not load session:", err.message);
+    console.log("⚠ Failed to download session:", err.message);
   }
 }
 
-// ---------------- Upload only when updates happen (Hybrid Mode) ----------------
-async function uploadUpdatedFiles(folderPath, changedFiles) {
-  for (const file of changedFiles) {
-    const filePath = path.join(folderPath, file);
-    const data = await fs.readFile(filePath);
+// ----------------------------
+// UPLOAD ONLY IF FILE UPDATED
+// ----------------------------
+async function uploadUpdatedFiles(authFolder) {
+  try {
+    const files = await fs.readdir(authFolder);
 
-    await supabase.storage.from(BUCKET_NAME)
-      .upload(`${CLIENT_ID}_auth/${file}`, data, { upsert: true });
+    for (const file of files) {
+      const filePath = path.join(authFolder, file);
+      const binary = await fs.readFile(filePath);
 
-    console.log("⬆ Session updated:", file);
+      await supabase.storage
+        .from(BUCKET_NAME)
+        .upload(`${CLIENT_ID}_auth/${file}`, binary, {
+          cacheControl: "0",
+          upsert: true
+        });
+    }
+
+    console.log("☁ Session updated to Supabase");
+  } catch (e) {
+    console.log("⚠ Session upload skipped:", e.message);
   }
 }
 
-// ---------------- Start Bot ----------------
+// ----------------------------------------------------
+// MAIN BOT
+// ----------------------------------------------------
 async function startBot() {
   const { version } = await fetchLatestBaileysVersion();
   const authFolder = path.resolve(`./${CLIENT_ID}_auth`);
+
   await downloadAuthFolder(authFolder);
 
   const { state, saveCreds } = await useMultiFileAuthState(authFolder);
@@ -76,53 +101,53 @@ async function startBot() {
   const sock = makeWASocket({
     logger: pino({ level: "silent" }),
     version,
-    auth: state,
+    auth: state
   });
 
-  // 🔥 Trigger only when WhatsApp updates keys
+  // On session update -> save locally AND upload to Supabase (hybrid)
   sock.ev.on("creds.update", async () => {
-    await saveCreds();                                 // write locally minimal
-    const files = Object.keys(state.creds || {});
-    uploadUpdatedFiles(authFolder, files);             // hybrid upload only changed
+    await saveCreds();
+    await uploadUpdatedFiles(authFolder);
   });
 
-  // ---------------- Connection handler ----------------
-  sock.ev.on("connection.update", ({ connection, lastDisconnect, qr }) => {
-    if (qr) qrcode.generate(qr, { small: true });
+  sock.ev.on("connection.update", (update) => {
+    const { connection, lastDisconnect, qr } = update;
+
+    if (qr) {
+      console.log("📲 Scan QR to login:");
+      qrcode.generate(qr, { small: true });
+    }
 
     if (connection === "open") console.log("✅ WhatsApp connected!");
 
     if (connection === "close") {
       const code = lastDisconnect?.error?.output?.statusCode;
-      console.log("⚠ Disconnected:", code);
-      if (code !== DisconnectReason.loggedOut) setTimeout(startBot, 4000);
+      if (code !== DisconnectReason.loggedOut) startBot();
       else console.log("❌ Logged out. Scan QR again.");
     }
   });
 
-  // ---------------- Handle messages ----------------
+  // ----------------------------------------------------
+  // MESSAGE RECEIVER + HYBRID JID NORMALIZER + RANDOM DELAY
+  // ----------------------------------------------------
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
     if (type !== "notify") return;
 
     for (const msg of messages) {
-      if (!msg.message || msg.key.fromMe) continue;
+      if (!msg.message || msg.key.fromMe) return;
 
       let jid = msg.key.remoteJid;
       const text = msg.message.conversation ??
                    msg.message.extendedTextMessage?.text ?? "";
 
-      if (!text) continue;
-
-      // ---- Convert to phone@c.us except group ----
+      // Convert IDs to standard c.us   (except groups)
       if (!jid.endsWith("@g.us")) {
-        const pn = msg.key.senderPn?.split("@")[0];
-        jid = pn ? `${pn}@c.us`
-                 : jid.replace(/@s.whatsapp.net|@lid.*/g, "@c.us");
+        jid = jid.replace("@s.whatsapp.net", "@c.us");
+        jid = jid.replace(/@lid.*/, "@c.us");
       }
 
-      console.log("📩", jid, ":", text);
+      console.log(`📩 Message from ${jid}: ${text}`);
 
-      // ---- Webhook handling ----
       if (N8N_WEBHOOK_URL) {
         try {
           const res = await fetch(N8N_WEBHOOK_URL, {
@@ -131,17 +156,21 @@ async function startBot() {
             body: JSON.stringify({ from: jid, message: text })
           });
 
-          let data = {};
-          try { data = await res.json(); } catch {};
-          if (Array.isArray(data)) data = data[0];
+          let replyData = {};
+          try { replyData = await res.json(); } catch {}
 
-          const reply = data?.Reply || data?.reply;
+          const reply = replyData?.reply || replyData?.Reply;
+
           if (reply) {
-            const delay = Math.floor(Math.random() * 11000) + 9000; // ~10–20 sec
-            setTimeout(() => sock.sendMessage(jid, { text: reply }), delay);
-            console.log("⏳ Reply queued:", delay/1000,"sec");
+            const delay = 10000 + Math.random() * 10000;
+            setTimeout(() => {
+              sock.sendMessage(jid, { text: reply });
+              console.log("💬 Sent reply:", reply);
+            }, delay);
           }
-        } catch (e) { console.log("Webhook error:", e.message); }
+        } catch (e) {
+          console.log("Webhook Error:", e.message);
+        }
       }
     }
   });
@@ -149,6 +178,6 @@ async function startBot() {
 
 startBot();
 
-// ---------------- Health page ----------------
-express().get("/", (r, s) => s.send("Bot Active ✓"))
-.listen(PORT, () => console.log("🌐 PORT", PORT));
+// Web server (prevent Render timeout)
+express().get("/", (r, s) => s.send("Bot Running ✓"))
+         .listen(PORT, () => console.log("🌐 PORT", PORT));
