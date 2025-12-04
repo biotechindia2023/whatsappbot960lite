@@ -32,22 +32,7 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
 // --- Supabase client ---
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-// --- Helper: Sync auth folder to Supabase ---
-async function uploadAuthFolder(authFolder) {
-  try {
-    const files = await fs.readdir(authFolder);
-    for (const file of files) {
-      const filePath = path.join(authFolder, file);
-      const buffer = await fs.readFile(filePath);
-      await supabase.storage.from(BUCKET_NAME)
-        .upload(`${CLIENT_ID}_auth/${file}`, buffer, { upsert: true });
-    }
-    console.log("💾 Auth folder synced to Supabase");
-  } catch (err) {
-    console.error("❌ Failed to upload auth folder:", err.message);
-  }
-}
-
+// --- Helper: Download auth folder from Supabase (read-only) ---
 async function downloadAuthFolder(authFolder) {
   try {
     const { data, error } = await supabase.storage.from(BUCKET_NAME).list(`${CLIENT_ID}_auth/`);
@@ -64,7 +49,7 @@ async function downloadAuthFolder(authFolder) {
       const buf = Buffer.from(await fileData.arrayBuffer());
       await fs.writeFile(path.join(authFolder, file.name), buf);
     }
-    console.log("✅ Auth folder downloaded from Supabase");
+    console.log("✅ Auth folder downloaded from Supabase (read-only)");
   } catch (err) {
     console.warn("⚠️ Failed to download auth folder:", err.message);
   }
@@ -80,15 +65,9 @@ async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState(authFolder);
 
   const sock = makeWASocket({
-    logger: pino({ level: "silent" }),  // <-- SILENT MODE ENABLED
+    logger: pino({ level: "silent" }),
     version,
     auth: state
-  });
-
-  // Save credentials and sync auth files to Supabase
-  sock.ev.on("creds.update", async () => {
-    await saveCreds();
-    await uploadAuthFolder(authFolder);
   });
 
   // Connection & QR / reconnect handling
@@ -128,10 +107,16 @@ async function startBot() {
 
       if (!text) continue;
 
-      // Convert @s.whatsapp.net → @c.us for personal messages only
-      if (jid.endsWith("@s.whatsapp.net") && !jid.endsWith("@g.us")) {
-        const phoneNumber = jid.split("@")[0];
-        jid = `${phoneNumber}@c.us`;
+      // --- Normalize personal chats to phoneNumber@c.us ---
+      if (!jid.endsWith("@g.us")) {
+        if (msg.key.senderPn) {
+          const phoneNumber = msg.key.senderPn.split("@")[0];
+          jid = `${phoneNumber}@c.us`;
+        } else if (jid.includes("@s.whatsapp.net")) {
+          jid = jid.replace("@s.whatsapp.net", "@c.us");
+        } else if (jid.includes("@lid")) {
+          jid = jid.replace(/@.*$/, "@c.us");
+        }
       }
 
       console.log(`📩 Message from ${jid}: ${text}`);
@@ -150,8 +135,12 @@ async function startBot() {
           if (Array.isArray(replyData)) replyData = replyData[0];
           const reply = replyData?.Reply ?? replyData?.reply;
           if (reply) {
-            await sock.sendMessage(jid, { text: reply });
-            console.log("💬 Reply sent:", reply);
+            // --- Add random delay between 10-20 seconds ---
+            const delay = Math.floor(Math.random() * (20000 - 10000 + 1)) + 10000;
+            setTimeout(async () => {
+              await sock.sendMessage(jid, { text: reply });
+              console.log("💬 Reply sent (delayed):", reply);
+            }, delay);
           }
         } catch (err) {
           console.error("❌ Error calling webhook:", err.message);
