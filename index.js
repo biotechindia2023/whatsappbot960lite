@@ -10,7 +10,8 @@ import makeWASocket, {
   DisconnectReason
 } from "@whiskeysockets/baileys";
 
-import pino from "pino";
+import pino from "pino";   // <-- SILENT MODE ENABLED
+
 import fs from "fs/promises";
 import path from "path";
 
@@ -22,78 +23,97 @@ const CLIENT_ID = process.env.WHATSAPP_CLIENT_ID || "bot-960lite";
 const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL || "";
 const PORT = process.env.PORT || 3000;
 
+// --- sanity checks ---
 if (!SUPABASE_URL || !SUPABASE_KEY) {
   console.error("❌ Supabase URL/KEY missing");
   process.exit(1);
 }
 
+// --- Supabase client ---
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-// ----------------------------
-// DOWNLOAD SESSION ON START
-// ----------------------------
+// --- Helper: Download auth folder from Supabase (read-only) ---
 async function downloadAuthFolder(authFolder) {
   try {
-    const { data, error } = await supabase.storage
-      .from(BUCKET_NAME)
-      .list(`${CLIENT_ID}_auth/`);
-
+    const { data, error } = await supabase.storage.from(BUCKET_NAME).list(`${CLIENT_ID}_auth/`);
     if (error || !data || data.length === 0) {
-      console.log("ℹ️ No previous session found. Fresh login needed.");
+      console.log("ℹ️ No auth files in Supabase, starting fresh");
       return;
     }
-
     await fs.mkdir(authFolder, { recursive: true });
-
     for (const file of data) {
-      const { data: fileData } = await supabase.storage
+      const { data: fileData, error: downloadErr } = await supabase.storage
         .from(BUCKET_NAME)
         .download(`${CLIENT_ID}_auth/${file.name}`);
-
-      if (!fileData) continue;
-
+      if (downloadErr || !fileData) continue;
       const buf = Buffer.from(await fileData.arrayBuffer());
       await fs.writeFile(path.join(authFolder, file.name), buf);
     }
-
-    console.log("✅ Session loaded (read-only start mode)");
+    console.log("✅ Auth folder downloaded from Supabase (read-only)");
   } catch (err) {
-    console.log("⚠ Failed to download session:", err.message);
+    console.warn("⚠️ Failed to download auth folder:", err.message);
   }
 }
 
-// ----------------------------
-// UPLOAD ONLY IF FILE UPDATED
-// ----------------------------
+// --- Helper: upload only updated files (hybrid small-write) ---
 async function uploadUpdatedFiles(authFolder) {
+  const metaPath = path.join(authFolder, ".uploaded_meta.json");
+  let meta = {};
+  try {
+    const metaBuf = await fs.readFile(metaPath, "utf8");
+    meta = JSON.parse(metaBuf);
+  } catch (err) {
+    // no meta file yet — start fresh
+    meta = {};
+  }
+
   try {
     const files = await fs.readdir(authFolder);
-
     for (const file of files) {
-      const filePath = path.join(authFolder, file);
-      const binary = await fs.readFile(filePath);
-
-      await supabase.storage
-        .from(BUCKET_NAME)
-        .upload(`${CLIENT_ID}_auth/${file}`, binary, {
-          cacheControl: "0",
-          upsert: true
-        });
+      if (file === ".uploaded_meta.json") continue; // skip meta
+      const fullPath = path.join(authFolder, file);
+      try {
+        const st = await fs.stat(fullPath);
+        const mtime = st.mtimeMs;
+        if (!meta[file] || mtime > meta[file]) {
+          // file is new or updated — upload
+          try {
+            const buffer = await fs.readFile(fullPath);
+            const { error } = await supabase.storage
+              .from(BUCKET_NAME)
+              .upload(`${CLIENT_ID}_auth/${file}`, buffer, { contentType: "application/octet-stream", upsert: true });
+            if (error) {
+              console.warn(`⚠ Session upload skipped (supabase error): ${file} — ${error.message || error}`);
+            } else {
+              meta[file] = mtime;
+              console.log(`☁ Session updated to Supabase: ${file}`);
+            }
+          } catch (readErr) {
+            // file may have disappeared between readdir and readFile
+            console.warn(`⚠ Session upload skipped: ${readErr.message}`);
+          }
+        }
+      } catch (statErr) {
+        // file not present or inaccessible — skip
+        console.warn(`⚠ Session upload skipped: ${statErr.message}`);
+      }
     }
-
-    console.log("☁ Session updated to Supabase");
-  } catch (e) {
-    console.log("⚠ Session upload skipped:", e.message);
+    // write meta back (best-effort)
+    try {
+      await fs.writeFile(metaPath, JSON.stringify(meta, null, 2), "utf8");
+    } catch (metaErr) {
+      console.warn("⚠ Failed to write upload meta:", metaErr.message);
+    }
+  } catch (err) {
+    console.warn("⚠ Failed to scan auth folder for uploads:", err.message);
   }
 }
 
-// ----------------------------------------------------
-// MAIN BOT
-// ----------------------------------------------------
+// --- Main bot start function ---
 async function startBot() {
   const { version } = await fetchLatestBaileysVersion();
-  const authFolder = path.resolve(`./${CLIENT_ID}_auth`);
 
+  const authFolder = path.resolve(`./${CLIENT_ID}_auth`);
   await downloadAuthFolder(authFolder);
 
   const { state, saveCreds } = await useMultiFileAuthState(authFolder);
@@ -104,46 +124,68 @@ async function startBot() {
     auth: state
   });
 
-  // On session update -> save locally AND upload to Supabase (hybrid)
+  // Hybrid: save locally and upload only changed files
   sock.ev.on("creds.update", async () => {
-    await saveCreds();
-    await uploadUpdatedFiles(authFolder);
+    try {
+      await saveCreds();
+    } catch (err) {
+      console.warn("⚠ Failed to save creds locally:", err?.message || err);
+    }
+    // upload only updated files (small/write-only)
+    try {
+      await uploadUpdatedFiles(authFolder);
+    } catch (err) {
+      console.warn("⚠ uploadUpdatedFiles error:", err?.message || err);
+    }
   });
 
+  // Connection & QR / reconnect handling
   sock.ev.on("connection.update", (update) => {
     const { connection, lastDisconnect, qr } = update;
-
     if (qr) {
-      console.log("📲 Scan QR to login:");
+      console.log("📲 QR RECEIVED - scan with WhatsApp:");
       qrcode.generate(qr, { small: true });
     }
-
-    if (connection === "open") console.log("✅ WhatsApp connected!");
-
+    if (connection === "open") {
+      console.log("✅ WhatsApp connected!");
+    }
     if (connection === "close") {
-      const code = lastDisconnect?.error?.output?.statusCode;
-      if (code !== DisconnectReason.loggedOut) startBot();
-      else console.log("❌ Logged out. Scan QR again.");
+      const statusCode = lastDisconnect?.error?.output?.statusCode;
+      console.warn("⚠️ Disconnected, status code:", statusCode);
+      if (statusCode !== DisconnectReason.loggedOut) {
+        console.log("Reconnecting...");
+        setTimeout(startBot, 5000);
+      } else {
+        console.log("❌ Logged out — scan QR again");
+      }
     }
   });
 
-  // ----------------------------------------------------
-  // MESSAGE RECEIVER + HYBRID JID NORMALIZER + RANDOM DELAY
-  // ----------------------------------------------------
-  sock.ev.on("messages.upsert", async ({ messages, type }) => {
+  // Handling incoming messages
+  sock.ev.on("messages.upsert", async (msgUpdate) => {
+    const { messages, type } = msgUpdate;
     if (type !== "notify") return;
 
     for (const msg of messages) {
-      if (!msg.message || msg.key.fromMe) return;
+      if (!msg.message || msg.key.fromMe) continue;
 
       let jid = msg.key.remoteJid;
-      const text = msg.message.conversation ??
-                   msg.message.extendedTextMessage?.text ?? "";
+      const text = msg.message.conversation
+        ?? msg.message.extendedTextMessage?.text
+        ?? "";
 
-      // Convert IDs to standard c.us   (except groups)
+      if (!text) continue;
+
+      // --- Normalize personal chats to phoneNumber@c.us ---
       if (!jid.endsWith("@g.us")) {
-        jid = jid.replace("@s.whatsapp.net", "@c.us");
-        jid = jid.replace(/@lid.*/, "@c.us");
+        if (msg.key.senderPn) {
+          const phoneNumber = msg.key.senderPn.split("@")[0];
+          jid = `${phoneNumber}@c.us`;
+        } else if (jid.includes("@s.whatsapp.net")) {
+          jid = jid.replace("@s.whatsapp.net", "@c.us");
+        } else if (jid.includes("@lid")) {
+          jid = jid.replace(/@.*$/, "@c.us");
+        }
       }
 
       console.log(`📩 Message from ${jid}: ${text}`);
@@ -153,31 +195,34 @@ async function startBot() {
           const res = await fetch(N8N_WEBHOOK_URL, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ from: jid, message: text })
+            body: JSON.stringify({ from: jid, message: text }),
           });
-
           let replyData = {};
-          try { replyData = await res.json(); } catch {}
-
-          const reply = replyData?.reply || replyData?.Reply;
-
+          try {
+            replyData = await res.json();
+          } catch {}
+          if (Array.isArray(replyData)) replyData = replyData[0];
+          const reply = replyData?.Reply ?? replyData?.reply;
           if (reply) {
-            const delay = 10000 + Math.random() * 10000;
-            setTimeout(() => {
-              sock.sendMessage(jid, { text: reply });
-              console.log("💬 Sent reply:", reply);
+            // --- Add random delay between 10-20 seconds ---
+            const delay = Math.floor(Math.random() * (20000 - 10000 + 1)) + 10000;
+            setTimeout(async () => {
+              await sock.sendMessage(jid, { text: reply });
+              console.log("💬 Reply sent (delayed):", reply);
             }, delay);
           }
-        } catch (e) {
-          console.log("Webhook Error:", e.message);
+        } catch (err) {
+          console.error("❌ Error calling webhook:", err.message);
         }
       }
     }
   });
 }
 
+// --- Start the bot ---
 startBot();
 
-// Web server (prevent Render timeout)
-express().get("/", (r, s) => s.send("Bot Running ✓"))
-         .listen(PORT, () => console.log("🌐 PORT", PORT));
+// --- Simple web server for health check ---
+const app = express();
+app.get("/", (_req, res) => res.send("✅ Bot is running"));
+app.listen(PORT, () => console.log(`🌐 HTTP server listening on port ${PORT}`));
