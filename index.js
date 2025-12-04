@@ -32,7 +32,22 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
 // --- Supabase client ---
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-// --- Helper: Download auth folder from Supabase (read-only) ---
+// --- Helper: Sync auth folder to Supabase ---
+async function uploadAuthFolder(authFolder) {
+  try {
+    const files = await fs.readdir(authFolder);
+    for (const file of files) {
+      const filePath = path.join(authFolder, file);
+      const buffer = await fs.readFile(filePath);
+      await supabase.storage.from(BUCKET_NAME)
+        .upload(`${CLIENT_ID}_auth/${file}`, buffer, { upsert: true });
+    }
+    console.log("💾 Auth folder synced to Supabase");
+  } catch (err) {
+    console.error("❌ Failed to upload auth folder:", err.message);
+  }
+}
+
 async function downloadAuthFolder(authFolder) {
   try {
     const { data, error } = await supabase.storage.from(BUCKET_NAME).list(`${CLIENT_ID}_auth/`);
@@ -49,63 +64,9 @@ async function downloadAuthFolder(authFolder) {
       const buf = Buffer.from(await fileData.arrayBuffer());
       await fs.writeFile(path.join(authFolder, file.name), buf);
     }
-    console.log("✅ Auth folder downloaded from Supabase (read-only)");
+    console.log("✅ Auth folder downloaded from Supabase");
   } catch (err) {
     console.warn("⚠️ Failed to download auth folder:", err.message);
-  }
-}
-
-// --- Helper: upload only updated files (hybrid small-write) ---
-async function uploadUpdatedFiles(authFolder) {
-  const metaPath = path.join(authFolder, ".uploaded_meta.json");
-  let meta = {};
-  try {
-    const metaBuf = await fs.readFile(metaPath, "utf8");
-    meta = JSON.parse(metaBuf);
-  } catch (err) {
-    // no meta file yet — start fresh
-    meta = {};
-  }
-
-  try {
-    const files = await fs.readdir(authFolder);
-    for (const file of files) {
-      if (file === ".uploaded_meta.json") continue; // skip meta
-      const fullPath = path.join(authFolder, file);
-      try {
-        const st = await fs.stat(fullPath);
-        const mtime = st.mtimeMs;
-        if (!meta[file] || mtime > meta[file]) {
-          // file is new or updated — upload
-          try {
-            const buffer = await fs.readFile(fullPath);
-            const { error } = await supabase.storage
-              .from(BUCKET_NAME)
-              .upload(`${CLIENT_ID}_auth/${file}`, buffer, { contentType: "application/octet-stream", upsert: true });
-            if (error) {
-              console.warn(`⚠ Session upload skipped (supabase error): ${file} — ${error.message || error}`);
-            } else {
-              meta[file] = mtime;
-              console.log(`☁ Session updated to Supabase: ${file}`);
-            }
-          } catch (readErr) {
-            // file may have disappeared between readdir and readFile
-            console.warn(`⚠ Session upload skipped: ${readErr.message}`);
-          }
-        }
-      } catch (statErr) {
-        // file not present or inaccessible — skip
-        console.warn(`⚠ Session upload skipped: ${statErr.message}`);
-      }
-    }
-    // write meta back (best-effort)
-    try {
-      await fs.writeFile(metaPath, JSON.stringify(meta, null, 2), "utf8");
-    } catch (metaErr) {
-      console.warn("⚠ Failed to write upload meta:", metaErr.message);
-    }
-  } catch (err) {
-    console.warn("⚠ Failed to scan auth folder for uploads:", err.message);
   }
 }
 
@@ -119,24 +80,15 @@ async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState(authFolder);
 
   const sock = makeWASocket({
-    logger: pino({ level: "silent" }),
+    logger: pino({ level: "silent" }),  // <-- SILENT MODE ENABLED
     version,
     auth: state
   });
 
-  // Hybrid: save locally and upload only changed files
+  // Save credentials and sync auth files to Supabase
   sock.ev.on("creds.update", async () => {
-    try {
-      await saveCreds();
-    } catch (err) {
-      console.warn("⚠ Failed to save creds locally:", err?.message || err);
-    }
-    // upload only updated files (small/write-only)
-    try {
-      await uploadUpdatedFiles(authFolder);
-    } catch (err) {
-      console.warn("⚠ uploadUpdatedFiles error:", err?.message || err);
-    }
+    await saveCreds();
+    await uploadAuthFolder(authFolder);
   });
 
   // Connection & QR / reconnect handling
@@ -176,16 +128,10 @@ async function startBot() {
 
       if (!text) continue;
 
-      // --- Normalize personal chats to phoneNumber@c.us ---
-      if (!jid.endsWith("@g.us")) {
-        if (msg.key.senderPn) {
-          const phoneNumber = msg.key.senderPn.split("@")[0];
-          jid = `${phoneNumber}@c.us`;
-        } else if (jid.includes("@s.whatsapp.net")) {
-          jid = jid.replace("@s.whatsapp.net", "@c.us");
-        } else if (jid.includes("@lid")) {
-          jid = jid.replace(/@.*$/, "@c.us");
-        }
+      // Convert @s.whatsapp.net → @c.us for personal messages only
+      if (jid.endsWith("@s.whatsapp.net") && !jid.endsWith("@g.us")) {
+        const phoneNumber = jid.split("@")[0];
+        jid = `${phoneNumber}@c.us`;
       }
 
       console.log(`📩 Message from ${jid}: ${text}`);
@@ -204,12 +150,8 @@ async function startBot() {
           if (Array.isArray(replyData)) replyData = replyData[0];
           const reply = replyData?.Reply ?? replyData?.reply;
           if (reply) {
-            // --- Add random delay between 10-20 seconds ---
-            const delay = Math.floor(Math.random() * (20000 - 10000 + 1)) + 10000;
-            setTimeout(async () => {
-              await sock.sendMessage(jid, { text: reply });
-              console.log("💬 Reply sent (delayed):", reply);
-            }, delay);
+            await sock.sendMessage(jid, { text: reply });
+            console.log("💬 Reply sent:", reply);
           }
         } catch (err) {
           console.error("❌ Error calling webhook:", err.message);
