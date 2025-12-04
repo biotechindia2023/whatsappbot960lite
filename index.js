@@ -10,8 +10,7 @@ import makeWASocket, {
   DisconnectReason
 } from "@whiskeysockets/baileys";
 
-import pino from "pino";   // <-- SILENT MODE ENABLED
-
+import pino from "pino"; // silent
 import fs from "fs/promises";
 import path from "path";
 
@@ -23,42 +22,52 @@ const CLIENT_ID = process.env.WHATSAPP_CLIENT_ID || "bot-960lite";
 const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL || "";
 const PORT = process.env.PORT || 3000;
 
-// --- sanity checks ---
 if (!SUPABASE_URL || !SUPABASE_KEY) {
   console.error("❌ Supabase URL/KEY missing");
   process.exit(1);
 }
 
-// --- Supabase client ---
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-// --- Helper: Download auth folder from Supabase (read-only) ---
+// ---------------- Download session (read-only start) ----------------
 async function downloadAuthFolder(authFolder) {
   try {
-    const { data, error } = await supabase.storage.from(BUCKET_NAME).list(`${CLIENT_ID}_auth/`);
-    if (error || !data || data.length === 0) {
-      console.log("ℹ️ No auth files in Supabase, starting fresh");
-      return;
-    }
+    const { data } = await supabase.storage.from(BUCKET_NAME).list(`${CLIENT_ID}_auth/`);
+    if (!data || data.length === 0) return console.log("ℹ️ No auth session found – new login");
+
     await fs.mkdir(authFolder, { recursive: true });
-    for (const file of data) {
-      const { data: fileData, error: downloadErr } = await supabase.storage
+
+    for (const f of data) {
+      const { data: file } = await supabase.storage
         .from(BUCKET_NAME)
-        .download(`${CLIENT_ID}_auth/${file.name}`);
-      if (downloadErr || !fileData) continue;
-      const buf = Buffer.from(await fileData.arrayBuffer());
-      await fs.writeFile(path.join(authFolder, file.name), buf);
+        .download(`${CLIENT_ID}_auth/${f.name}`);
+
+      if (!file) continue;
+      const buf = Buffer.from(await file.arrayBuffer());
+      await fs.writeFile(path.join(authFolder, f.name), buf);
     }
-    console.log("✅ Auth folder downloaded from Supabase (read-only)");
+    console.log("✅ Session loaded (read-only start mode)");
   } catch (err) {
-    console.warn("⚠️ Failed to download auth folder:", err.message);
+    console.log("⚠️ Could not load session:", err.message);
   }
 }
 
-// --- Main bot start function ---
+// ---------------- Upload only when updates happen (Hybrid Mode) ----------------
+async function uploadUpdatedFiles(folderPath, changedFiles) {
+  for (const file of changedFiles) {
+    const filePath = path.join(folderPath, file);
+    const data = await fs.readFile(filePath);
+
+    await supabase.storage.from(BUCKET_NAME)
+      .upload(`${CLIENT_ID}_auth/${file}`, data, { upsert: true });
+
+    console.log("⬆ Session updated:", file);
+  }
+}
+
+// ---------------- Start Bot ----------------
 async function startBot() {
   const { version } = await fetchLatestBaileysVersion();
-
   const authFolder = path.resolve(`./${CLIENT_ID}_auth`);
   await downloadAuthFolder(authFolder);
 
@@ -67,93 +76,79 @@ async function startBot() {
   const sock = makeWASocket({
     logger: pino({ level: "silent" }),
     version,
-    auth: state
+    auth: state,
   });
 
-  // Connection & QR / reconnect handling
-  sock.ev.on("connection.update", (update) => {
-    const { connection, lastDisconnect, qr } = update;
-    if (qr) {
-      console.log("📲 QR RECEIVED - scan with WhatsApp:");
-      qrcode.generate(qr, { small: true });
-    }
-    if (connection === "open") {
-      console.log("✅ WhatsApp connected!");
-    }
+  // 🔥 Trigger only when WhatsApp updates keys
+  sock.ev.on("creds.update", async () => {
+    await saveCreds();                                 // write locally minimal
+    const files = Object.keys(state.creds || {});
+    uploadUpdatedFiles(authFolder, files);             // hybrid upload only changed
+  });
+
+  // ---------------- Connection handler ----------------
+  sock.ev.on("connection.update", ({ connection, lastDisconnect, qr }) => {
+    if (qr) qrcode.generate(qr, { small: true });
+
+    if (connection === "open") console.log("✅ WhatsApp connected!");
+
     if (connection === "close") {
-      const statusCode = lastDisconnect?.error?.output?.statusCode;
-      console.warn("⚠️ Disconnected, status code:", statusCode);
-      if (statusCode !== DisconnectReason.loggedOut) {
-        console.log("Reconnecting...");
-        setTimeout(startBot, 5000);
-      } else {
-        console.log("❌ Logged out — scan QR again");
-      }
+      const code = lastDisconnect?.error?.output?.statusCode;
+      console.log("⚠ Disconnected:", code);
+      if (code !== DisconnectReason.loggedOut) setTimeout(startBot, 4000);
+      else console.log("❌ Logged out. Scan QR again.");
     }
   });
 
-  // Handling incoming messages
-  sock.ev.on("messages.upsert", async (msgUpdate) => {
-    const { messages, type } = msgUpdate;
+  // ---------------- Handle messages ----------------
+  sock.ev.on("messages.upsert", async ({ messages, type }) => {
     if (type !== "notify") return;
 
     for (const msg of messages) {
       if (!msg.message || msg.key.fromMe) continue;
 
       let jid = msg.key.remoteJid;
-      const text = msg.message.conversation
-        ?? msg.message.extendedTextMessage?.text
-        ?? "";
+      const text = msg.message.conversation ??
+                   msg.message.extendedTextMessage?.text ?? "";
 
       if (!text) continue;
 
-      // --- Normalize personal chats to phoneNumber@c.us ---
+      // ---- Convert to phone@c.us except group ----
       if (!jid.endsWith("@g.us")) {
-        if (msg.key.senderPn) {
-          const phoneNumber = msg.key.senderPn.split("@")[0];
-          jid = `${phoneNumber}@c.us`;
-        } else if (jid.includes("@s.whatsapp.net")) {
-          jid = jid.replace("@s.whatsapp.net", "@c.us");
-        } else if (jid.includes("@lid")) {
-          jid = jid.replace(/@.*$/, "@c.us");
-        }
+        const pn = msg.key.senderPn?.split("@")[0];
+        jid = pn ? `${pn}@c.us`
+                 : jid.replace(/@s.whatsapp.net|@lid.*/g, "@c.us");
       }
 
-      console.log(`📩 Message from ${jid}: ${text}`);
+      console.log("📩", jid, ":", text);
 
+      // ---- Webhook handling ----
       if (N8N_WEBHOOK_URL) {
         try {
           const res = await fetch(N8N_WEBHOOK_URL, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ from: jid, message: text }),
+            body: JSON.stringify({ from: jid, message: text })
           });
-          let replyData = {};
-          try {
-            replyData = await res.json();
-          } catch {}
-          if (Array.isArray(replyData)) replyData = replyData[0];
-          const reply = replyData?.Reply ?? replyData?.reply;
+
+          let data = {};
+          try { data = await res.json(); } catch {};
+          if (Array.isArray(data)) data = data[0];
+
+          const reply = data?.Reply || data?.reply;
           if (reply) {
-            // --- Add random delay between 10-20 seconds ---
-            const delay = Math.floor(Math.random() * (20000 - 10000 + 1)) + 10000;
-            setTimeout(async () => {
-              await sock.sendMessage(jid, { text: reply });
-              console.log("💬 Reply sent (delayed):", reply);
-            }, delay);
+            const delay = Math.floor(Math.random() * 11000) + 9000; // ~10–20 sec
+            setTimeout(() => sock.sendMessage(jid, { text: reply }), delay);
+            console.log("⏳ Reply queued:", delay/1000,"sec");
           }
-        } catch (err) {
-          console.error("❌ Error calling webhook:", err.message);
-        }
+        } catch (e) { console.log("Webhook error:", e.message); }
       }
     }
   });
 }
 
-// --- Start the bot ---
 startBot();
 
-// --- Simple web server for health check ---
-const app = express();
-app.get("/", (_req, res) => res.send("✅ Bot is running"));
-app.listen(PORT, () => console.log(`🌐 HTTP server listening on port ${PORT}`));
+// ---------------- Health page ----------------
+express().get("/", (r, s) => s.send("Bot Active ✓"))
+.listen(PORT, () => console.log("🌐 PORT", PORT));
