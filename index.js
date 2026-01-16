@@ -123,6 +123,7 @@ async function startBot() {
   });
 
   // Handling incoming messages
+  if (msg.key.remoteJid === "status@broadcast") return;
   sock.ev.on("messages.upsert", async (msgUpdate) => {
     const { messages, type } = msgUpdate;
     if (type !== "notify") return;
@@ -218,3 +219,4 @@ app.post("/send", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
