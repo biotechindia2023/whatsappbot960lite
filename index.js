@@ -11,9 +11,13 @@ import makeWASocket, {
 } from "@whiskeysockets/baileys";
 
 import pino from "pino";   // <-- SILENT MODE ENABLED
-
 import fs from "fs/promises";
 import path from "path";
+import { createReadStream } from "fs";
+
+// --- DEDUPLICATION CACHE ---
+const processedMessages = new Set();
+const CACHE_LIMIT = 500;
 
 // --- ENV CONFIG ---
 const SUPABASE_URL = process.env.SUPABASE_URL;
@@ -32,7 +36,7 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
 // --- Supabase client ---
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-// --- Helper: Download auth folder from Supabase (read-only) ---
+// --- Helper: Download auth folder from Supabase ---
 async function downloadAuthFolder(authFolder) {
   try {
     const { data, error } = await supabase.storage.from(BUCKET_NAME).list(`${CLIENT_ID}_auth/`);
@@ -49,9 +53,26 @@ async function downloadAuthFolder(authFolder) {
       const buf = Buffer.from(await fileData.arrayBuffer());
       await fs.writeFile(path.join(authFolder, file.name), buf);
     }
-    console.log("✅ Auth folder downloaded from Supabase (read-only)");
+    console.log("✅ Auth folder downloaded from Supabase (read/write)");
   } catch (err) {
     console.warn("⚠️ Failed to download auth folder:", err.message);
+  }
+}
+
+// --- Helper: Upload auth folder to Supabase ---
+async function uploadAuthFolder(authFolder) {
+  try {
+    const files = await fs.readdir(authFolder);
+    for (const file of files) {
+      const filePath = path.join(authFolder, file);
+      const stream = createReadStream(filePath);
+      await supabase.storage
+        .from(BUCKET_NAME)
+        .upload(`${CLIENT_ID}_auth/${file}`, stream, { upsert: true });
+    }
+    console.log("☁ Auth folder uploaded to Supabase (read/write)");
+  } catch (err) {
+    console.warn("⚠️ Failed to upload auth folder:", err.message);
   }
 }
 
@@ -68,6 +89,15 @@ async function startBot() {
     logger: pino({ level: "silent" }),
     version,
     auth: state
+  });
+
+  global.sock = sock;
+  global.saveCreds = saveCreds;
+
+  // Upload session whenever credentials change
+  sock.ev.on("creds.update", async () => {
+    await saveCreds();
+    await uploadAuthFolder(authFolder);
   });
 
   // Connection & QR / reconnect handling
@@ -98,7 +128,18 @@ async function startBot() {
     if (type !== "notify") return;
 
     for (const msg of messages) {
+      // --- DEDUPLICATION CHECK ---
+      const msgId = msg.key.id;
+      if (processedMessages.has(msgId)) continue;
+
       if (!msg.message || msg.key.fromMe) continue;
+
+      // Mark as processed
+      processedMessages.add(msgId);
+      if (processedMessages.size > CACHE_LIMIT) {
+        const firstItem = processedMessages.values().next().value;
+        processedMessages.delete(firstItem);
+      }
 
       let jid = msg.key.remoteJid;
       const text = msg.message.conversation
@@ -107,7 +148,7 @@ async function startBot() {
 
       if (!text) continue;
 
-     // --- Normalize personal chats to phoneNumber@c.us ---
+   // --- Normalize personal chats to phoneNumber@c.us ---
 if (!jid.endsWith("@g.us")) {
     // 1. Try to get the actual Phone Number from senderPn if available
     if (msg.key.senderPn) {
@@ -133,17 +174,15 @@ if (!jid.endsWith("@g.us")) {
             body: JSON.stringify({ from: jid, message: text }),
           });
           let replyData = {};
-          try {
-            replyData = await res.json();
-          } catch {}
+          try { replyData = await res.json(); } catch {}
           if (Array.isArray(replyData)) replyData = replyData[0];
           const reply = replyData?.Reply ?? replyData?.reply;
+
           if (reply) {
-            // --- Add random delay between 10-20 seconds ---
             const delay = Math.floor(Math.random() * (20000 - 10000 + 1)) + 10000;
             setTimeout(async () => {
               await sock.sendMessage(jid, { text: reply });
-              console.log("💬 Reply sent :", reply);
+              console.log("💬 Reply sent:", reply);
             }, delay);
           }
         } catch (err) {
@@ -159,6 +198,23 @@ startBot();
 
 // --- Simple web server for health check ---
 const app = express();
+app.use(express.json());
+
 app.get("/", (_req, res) => res.send("✅ Bot is running"));
 app.listen(PORT, () => console.log(`🌐 HTTP server listening on port ${PORT}`));
 
+// --- API endpoint to send message externally ---
+app.post("/send", async (req, res) => {
+  try {
+    const { to, message } = req.body;
+    if (!to || !message) return res.status(400).json({ error: "to & message required" });
+
+    const jid = to.includes("@") ? to : `${to}@c.us`;
+
+    await global.sock.sendMessage(jid, { text: message });
+
+    res.json({ success: true, sent_to: jid });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
