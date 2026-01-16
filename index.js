@@ -107,17 +107,21 @@ async function startBot() {
 
       if (!text) continue;
 
-      // --- Normalize personal chats to phoneNumber@c.us ---
-      if (!jid.endsWith("@g.us")) {
-        if (msg.key.senderPn) {
-          const phoneNumber = msg.key.senderPn.split("@")[0];
-          jid = `${phoneNumber}@c.us`;
-        } else if (jid.includes("@s.whatsapp.net")) {
-          jid = jid.replace("@s.whatsapp.net", "@c.us");
-        } else if (jid.includes("@lid")) {
-          jid = jid.replace(/@.*$/, "@c.us");
-        }
-      }
+     // --- Normalize personal chats to phoneNumber@c.us ---
+if (!jid.endsWith("@g.us")) {
+    // 1. Try to get the actual Phone Number from senderPn if available
+    if (msg.key.senderPn) {
+        jid = msg.key.senderPn.split("@")[0] + "@c.us";
+    } 
+    // 2. If it's a standard user JID, ensure it ends with @c.us
+    else if (jid.includes("@s.whatsapp.net")) {
+        jid = jid.split("@")[0] + "@c.us";
+    } 
+    // 3. Handle LID (Internal IDs) - Strip everything after @ and force @c.us
+    else if (jid.includes("@lid")) {
+        jid = jid.split("@")[0] + "@c.us";
+    }
+}
 
       console.log(`📩 Message from ${jid}: ${text}`);
 
@@ -139,7 +143,7 @@ async function startBot() {
             const delay = Math.floor(Math.random() * (20000 - 10000 + 1)) + 10000;
             setTimeout(async () => {
               await sock.sendMessage(jid, { text: reply });
-              console.log("💬 Reply sent (delayed):", reply);
+              console.log("💬 Reply sent :", reply);
             }, delay);
           }
         } catch (err) {
@@ -157,3 +161,4 @@ startBot();
 const app = express();
 app.get("/", (_req, res) => res.send("✅ Bot is running"));
 app.listen(PORT, () => console.log(`🌐 HTTP server listening on port ${PORT}`));
+
