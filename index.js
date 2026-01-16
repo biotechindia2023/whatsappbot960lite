@@ -101,35 +101,44 @@ async function startBot() {
   });
 
   // Connection & QR / reconnect handling
-  sock.ev.on("connection.update", (update) => {
-    const { connection, lastDisconnect, qr } = update;
-    if (qr) {
-      console.log("📲 QR RECEIVED - scan with WhatsApp:");
-      qrcode.generate(qr, { small: true });
+sock.ev.on("connection.update", (update) => {
+  const { connection, lastDisconnect, qr } = update;
+
+  if (qr) {
+    console.log("📲 QR RECEIVED - scan with WhatsApp:");
+    qrcode.generate(qr, { small: true });
+  }
+
+  if (connection === "open") {
+    console.log("✅ WhatsApp connected!");
+  }
+
+  if (connection === "close") {
+    const statusCode = lastDisconnect?.error?.output?.statusCode;
+    console.warn("⚠️ Disconnected, status code:", statusCode);
+
+    // 🔴 LOGGED OUT — DO NOT RECONNECT
+    if (statusCode === DisconnectReason.loggedOut) {
+      console.log("❌ Logged out — delete auth and restart to get QR");
+      return;
     }
-    if (connection === "open") {
-      console.log("✅ WhatsApp connected!");
-    }
-    if (connection === "close") {
-      const statusCode = lastDisconnect?.error?.output?.statusCode;
-      console.warn("⚠️ Disconnected, status code:", statusCode);
-      if (statusCode !== DisconnectReason.loggedOut) {
-        console.log("Reconnecting...");
-        setTimeout(startBot, 5000);
-      } else {
-        console.log("❌ Logged out — scan QR again");
-      }
-    }
-  });
+
+    // 🔁 OTHER DISCONNECTS — AUTO RECONNECT
+    console.log("🔁 Reconnecting in 5 seconds...");
+    setTimeout(startBot, 5000);
+  }
+});
 
   // Handling incoming messages
-  if (msg.key.remoteJid === "status@broadcast") return;
+  
   sock.ev.on("messages.upsert", async (msgUpdate) => {
     const { messages, type } = msgUpdate;
     if (type !== "notify") return;
 
     for (const msg of messages) {
-      // --- DEDUPLICATION CHECK ---
+  // ✅ IGNORE STATUS / BROADCAST MESSAGES
+    if (msg.key?.remoteJid === "status@broadcast") continue;
+          // --- DEDUPLICATION CHECK ---
       const msgId = msg.key.id;
       if (processedMessages.has(msgId)) continue;
 
@@ -219,4 +228,5 @@ app.post("/send", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
 
