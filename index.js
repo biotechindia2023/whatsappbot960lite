@@ -218,7 +218,36 @@ async function startBot() {
           const res = await fetch(N8N_WEBHOOK_URL, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ from: jid, message: text })
+            body: JSON.stringify({
+  from: jid,
+  message: text,
+
+  // 🔍 RAW METADATA FOR ANALYSIS
+  meta: {
+    messageId: msg.key?.id,
+    fromMe: msg.key?.fromMe ?? false,
+    pushName: msg.pushName ?? null,
+    timestamp: msg.messageTimestamp ?? null,
+
+    chatType: msg.key?.remoteJid?.endsWith("@g.us")
+      ? "group"
+      : "personal",
+
+    jids: {
+      resolved: jid,                         // what bot used
+      remoteJid: msg.key?.remoteJid ?? null,
+      participant: msg.participant ?? msg.key?.participant ?? null,
+      senderPn: msg.key?.senderPn ?? msg.senderPn ?? null
+    },
+
+    rawKey: {
+      remoteJid: msg.key?.remoteJid,
+      participant: msg.key?.participant,
+      senderPn: msg.key?.senderPn
+    }
+  }
+}),
+
           });
 
           let replyData = {};
@@ -272,3 +301,4 @@ app.post("/send", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
