@@ -7,18 +7,13 @@ import { createClient } from "@supabase/supabase-js";
 import makeWASocket, {
   fetchLatestBaileysVersion,
   useMultiFileAuthState,
-  DisconnectReason,
-  jidNormalizedUser
+  DisconnectReason
 } from "@whiskeysockets/baileys";
 
-import pino from "pino";
+import pino from "pino";   // <-- SILENT MODE ENABLED
 import fs from "fs/promises";
 import path from "path";
 import { createReadStream } from "fs";
-
-// --- DEDUPLICATION CACHE ---
-const processedMessages = new Set();
-const CACHE_LIMIT = 500;
 
 // --- ENV CONFIG ---
 const SUPABASE_URL = process.env.SUPABASE_URL;
@@ -37,87 +32,24 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
 // --- Supabase client ---
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-/**
- * 🔐 Resolve correct sender JID (production-safe)
- * Priority:
- * 1. senderPn
- * 2. participant
- * 3. remoteJid
- */
-function resolveIncomingJid(msg) {
-  // Groups: keep original g.us
-  if (msg.key.remoteJid?.endsWith("@g.us")) {
-    return msg.key.remoteJid;
-  }
-
-  const senderPn =
-    msg.key?.senderPn ||
-    msg.senderPn ||
-    undefined;
-
-  let rawJid =
-    senderPn ||
-    msg.participant ||
-    msg.key.participant ||
-    msg.key.remoteJid;
-
-  if (!rawJid) {
-    console.warn("⚠️ Unable to resolve sender JID, using remoteJid");
-    rawJid = msg.key.remoteJid;
-  }
-
-  // Strip @lid if present
-  if (rawJid.includes("@lid")) {
-    console.warn(`⚠️ @lid detected, stripping: ${rawJid}`);
-    rawJid = rawJid.split("@")[0] + "@s.whatsapp.net";
-  }
-
-  // Normalize via Baileys
-  let normalized = jidNormalizedUser(rawJid);
-
-  // Brazil mobile fix (55 + XX + 9 + 8 digits)
-  const numberOnly = normalized.replace(/\D/g, "");
-  if (
-    numberOnly.startsWith("55") &&
-    numberOnly.length === 12 &&
-    numberOnly[4] !== "9"
-  ) {
-    const fixed =
-      numberOnly.slice(0, 4) + "9" + numberOnly.slice(4);
-    console.warn(`⚠️ Fixed BR number: ${numberOnly} → ${fixed}`);
-    normalized = fixed + "@s.whatsapp.net";
-  }
-
-  // Your system uses @c.us → convert AFTER normalization
-  return normalized.replace("@s.whatsapp.net", "@c.us");
-}
-
 // --- Helper: Download auth folder from Supabase ---
 async function downloadAuthFolder(authFolder) {
   try {
-    const { data } = await supabase.storage
-      .from(BUCKET_NAME)
-      .list(`${CLIENT_ID}_auth/`);
-
-    if (!data || data.length === 0) {
+    const { data, error } = await supabase.storage.from(BUCKET_NAME).list(`${CLIENT_ID}_auth/`);
+    if (error || !data || data.length === 0) {
       console.log("ℹ️ No auth files in Supabase, starting fresh");
       return;
     }
-
     await fs.mkdir(authFolder, { recursive: true });
-
     for (const file of data) {
-      const { data: fileData } = await supabase.storage
+      const { data: fileData, error: downloadErr } = await supabase.storage
         .from(BUCKET_NAME)
         .download(`${CLIENT_ID}_auth/${file.name}`);
-
-      if (!fileData) continue;
-
+      if (downloadErr || !fileData) continue;
       const buf = Buffer.from(await fileData.arrayBuffer());
       await fs.writeFile(path.join(authFolder, file.name), buf);
     }
-
-    console.log("✅ Auth folder downloaded from Supabase");
+    console.log("✅ Auth folder downloaded from Supabase (read/write)");
   } catch (err) {
     console.warn("⚠️ Failed to download auth folder:", err.message);
   }
@@ -128,12 +60,13 @@ async function uploadAuthFolder(authFolder) {
   try {
     const files = await fs.readdir(authFolder);
     for (const file of files) {
-      const stream = createReadStream(path.join(authFolder, file));
+      const filePath = path.join(authFolder, file);
+      const stream = createReadStream(filePath);
       await supabase.storage
         .from(BUCKET_NAME)
         .upload(`${CLIENT_ID}_auth/${file}`, stream, { upsert: true });
     }
-    console.log("☁ Auth folder uploaded to Supabase");
+    console.log("☁ Auth folder uploaded to Supabase (read/write)");
   } catch (err) {
     console.warn("⚠️ Failed to upload auth folder:", err.message);
   }
@@ -142,9 +75,10 @@ async function uploadAuthFolder(authFolder) {
 // --- Main bot start function ---
 async function startBot() {
   const { version } = await fetchLatestBaileysVersion();
-  const authFolder = path.resolve(`./${CLIENT_ID}_auth`);
 
+  const authFolder = path.resolve(`./${CLIENT_ID}_auth`);
   await downloadAuthFolder(authFolder);
+
   const { state, saveCreds } = await useMultiFileAuthState(authFolder);
 
   const sock = makeWASocket({
@@ -154,62 +88,62 @@ async function startBot() {
   });
 
   global.sock = sock;
+  global.saveCreds = saveCreds;
 
+  // Upload session whenever credentials change
   sock.ev.on("creds.update", async () => {
     await saveCreds();
     await uploadAuthFolder(authFolder);
   });
 
+  // Connection & QR / reconnect handling
   sock.ev.on("connection.update", (update) => {
     const { connection, lastDisconnect, qr } = update;
-
     if (qr) {
-      console.log("📲 QR RECEIVED:");
+      console.log("📲 QR RECEIVED - scan with WhatsApp:");
       qrcode.generate(qr, { small: true });
     }
-
     if (connection === "open") {
       console.log("✅ WhatsApp connected!");
     }
-
     if (connection === "close") {
-      const code = lastDisconnect?.error?.output?.statusCode;
-      console.warn("⚠️ Disconnected:", code);
-
-      if (code === DisconnectReason.loggedOut) {
-        console.log("❌ Logged out — restart required");
-        return;
+      const statusCode = lastDisconnect?.error?.output?.statusCode;
+      console.warn("⚠️ Disconnected, status code:", statusCode);
+      if (statusCode !== DisconnectReason.loggedOut) {
+        console.log("Reconnecting...");
+        setTimeout(startBot, 5000);
+      } else {
+        console.log("❌ Logged out — scan QR again");
       }
-
-      console.log("🔁 Reconnecting in 5s...");
-      setTimeout(startBot, 5000);
     }
   });
 
-  // --- Incoming messages ---
-  sock.ev.on("messages.upsert", async ({ messages, type }) => {
+  // Handling incoming messages
+  sock.ev.on("messages.upsert", async (msgUpdate) => {
+    const { messages, type } = msgUpdate;
     if (type !== "notify") return;
 
     for (const msg of messages) {
-      if (msg.key?.remoteJid === "status@broadcast") continue;
       if (!msg.message || msg.key.fromMe) continue;
 
-      const msgId = msg.key.id;
-      if (processedMessages.has(msgId)) continue;
-
-      processedMessages.add(msgId);
-      if (processedMessages.size > CACHE_LIMIT) {
-        processedMessages.delete(processedMessages.values().next().value);
-      }
-
-      const text =
-        msg.message.conversation ??
-        msg.message.extendedTextMessage?.text ??
-        "";
+      let jid = msg.key.remoteJid;
+      const text = msg.message.conversation
+        ?? msg.message.extendedTextMessage?.text
+        ?? "";
 
       if (!text) continue;
 
-      const jid = resolveIncomingJid(msg);
+      // --- Normalize personal chats to phoneNumber@c.us ---
+      if (!jid.endsWith("@g.us")) {
+        if (msg.key.senderPn) {
+          const phoneNumber = msg.key.senderPn.split("@")[0];
+          jid = `${phoneNumber}@c.us`;
+        } else if (jid.includes("@s.whatsapp.net")) {
+          jid = jid.replace("@s.whatsapp.net", "@c.us");
+        } else if (jid.includes("@lid")) {
+          jid = jid.replace(/@.*$/, "@c.us");
+        }
+      }
 
       console.log(`📩 Message from ${jid}: ${text}`);
 
@@ -218,87 +152,50 @@ async function startBot() {
           const res = await fetch(N8N_WEBHOOK_URL, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-  from: jid,
-  message: text,
-
-  // 🔍 RAW METADATA FOR ANALYSIS
-  meta: {
-    messageId: msg.key?.id,
-    fromMe: msg.key?.fromMe ?? false,
-    pushName: msg.pushName ?? null,
-    timestamp: msg.messageTimestamp ?? null,
-
-    chatType: msg.key?.remoteJid?.endsWith("@g.us")
-      ? "group"
-      : "personal",
-
-    jids: {
-      resolved: jid,                         // what bot used
-      remoteJid: msg.key?.remoteJid ?? null,
-      participant: msg.participant ?? msg.key?.participant ?? null,
-      senderPn: msg.key?.senderPn ?? msg.senderPn ?? null
-    },
-
-    rawKey: {
-      remoteJid: msg.key?.remoteJid,
-      participant: msg.key?.participant,
-      senderPn: msg.key?.senderPn
-    }
-  }
-}),
-
+            body: JSON.stringify({ from: jid, message: text }),
           });
-
           let replyData = {};
           try { replyData = await res.json(); } catch {}
-
+          if (Array.isArray(replyData)) replyData = replyData[0];
           const reply = replyData?.Reply ?? replyData?.reply;
 
           if (reply) {
-            const delay = Math.floor(Math.random() * 10000) + 10000;
+            const delay = Math.floor(Math.random() * (20000 - 10000 + 1)) + 10000;
             setTimeout(async () => {
               await sock.sendMessage(jid, { text: reply });
-              console.log("💬 Reply sent:", reply);
+              console.log("💬 Reply sent (delayed):", reply);
             }, delay);
           }
         } catch (err) {
-          console.error("❌ Webhook error:", err.message);
+          console.error("❌ Error calling webhook:", err.message);
         }
       }
     }
   });
 }
 
-// --- Start ---
+// --- Start the bot ---
 startBot();
 
-// --- Health server ---
+// --- Simple web server for health check ---
 const app = express();
 app.use(express.json());
 
 app.get("/", (_req, res) => res.send("✅ Bot is running"));
-app.listen(PORT, () =>
-  console.log(`🌐 HTTP server listening on ${PORT}`)
-);
+app.listen(PORT, () => console.log(`🌐 HTTP server listening on port ${PORT}`));
 
-// --- External send API ---
+// --- API endpoint to send message externally ---
 app.post("/send", async (req, res) => {
   try {
     const { to, message } = req.body;
-    if (!to || !message) {
-      return res.status(400).json({ error: "to & message required" });
-    }
+    if (!to || !message) return res.status(400).json({ error: "to & message required" });
 
-    const normalized = jidNormalizedUser(
-      to.includes("@") ? to : `${to}@s.whatsapp.net`
-    ).replace("@s.whatsapp.net", "@c.us");
+    const jid = to.includes("@") ? to : `${to}@c.us`;
 
-    await global.sock.sendMessage(normalized, { text: message });
+    await global.sock.sendMessage(jid, { text: message });
 
-    res.json({ success: true, sent_to: normalized });
+    res.json({ success: true, sent_to: jid });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
-
