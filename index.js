@@ -15,11 +15,15 @@ import fs from "fs/promises";
 import path from "path";
 import { createReadStream } from "fs";
 
+// --- DEDUPLICATION CACHE ---
+const processedMessages = new Set();
+const CACHE_LIMIT = 500;
+
 // --- ENV CONFIG ---
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_KEY;
 const BUCKET_NAME = process.env.SUPABASE_BUCKET || "whatsapp-sessions";
-const CLIENT_ID = process.env.WHATSAPP_CLIENT_ID || "bot-960lite";
+const CLIENT_ID = process.env.WHATSAPP_CLIENT_ID || "bot-478lite";
 const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL || "";
 const PORT = process.env.PORT || 3000;
 
@@ -90,13 +94,11 @@ async function startBot() {
   global.sock = sock;
   global.saveCreds = saveCreds;
 
-  // Upload session whenever credentials change
   sock.ev.on("creds.update", async () => {
     await saveCreds();
     await uploadAuthFolder(authFolder);
   });
 
-  // Connection & QR / reconnect handling
   sock.ev.on("connection.update", (update) => {
     const { connection, lastDisconnect, qr } = update;
     if (qr) {
@@ -118,52 +120,76 @@ async function startBot() {
     }
   });
 
-  // Handling incoming messages
+  // --- Incoming messages (PERSONAL CHATS ONLY) ---
   sock.ev.on("messages.upsert", async (msgUpdate) => {
     const { messages, type } = msgUpdate;
     if (type !== "notify") return;
 
     for (const msg of messages) {
+      const msgId = msg.key.id;
+      if (processedMessages.has(msgId)) continue;
       if (!msg.message || msg.key.fromMe) continue;
 
-      let jid = msg.key.remoteJid;
-      const text = msg.message.conversation
-        ?? msg.message.extendedTextMessage?.text
-        ?? "";
+      const jid = msg.key.remoteJid;
+
+      // ❌ Ignore group chats completely
+      if (jid.endsWith("@g.us")) continue;
+
+      processedMessages.add(msgId);
+      if (processedMessages.size > CACHE_LIMIT) {
+        processedMessages.delete(processedMessages.values().next().value);
+      }
+
+      const text =
+        msg.message.conversation ??
+        msg.message.extendedTextMessage?.text ??
+        "";
 
       if (!text) continue;
 
-      // --- Normalize personal chats to phoneNumber@c.us ---
-      if (!jid.endsWith("@g.us")) {
-        if (msg.key.senderPn) {
-          const phoneNumber = msg.key.senderPn.split("@")[0];
-          jid = `${phoneNumber}@c.us`;
-        } else if (jid.includes("@s.whatsapp.net")) {
-          jid = jid.replace("@s.whatsapp.net", "@c.us");
-        } else if (jid.includes("@lid")) {
-          jid = jid.replace(/@.*$/, "@c.us");
-        }
-      }
+      // --- Sender phone number (personal chat) ---
+      const senderPhone =
+  	msg.key?.senderPn
+    	? msg.key.senderPn.split("@")[0]
+    	: msg.key?.remoteJid?.includes("@")
+      	? msg.key.remoteJid.split("@")[0]
+      	: msg.key.remoteJid;
 
-      console.log(`📩 Message from ${jid}: ${text}`);
+      console.log(`📩 Message from ${senderPhone}: ${text}`);
 
       if (N8N_WEBHOOK_URL) {
         try {
           const res = await fetch(N8N_WEBHOOK_URL, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ from: jid, message: text }),
+            body: JSON.stringify({
+  	// 🔒 DO NOT CHANGE (n8n depends on these)
+  	from: senderPhone,
+  	message: text,
+
+  	// 🔍 EXTRA DEBUG DATA (new fields only)
+  	jid: jid,
+  	participant: msg.key.participant || null,
+  	pushName: msg.pushName || null,
+  	key: msg.key,
+  	messageTimestamp: msg.messageTimestamp,
+  	messageType: Object.keys(msg.message || {}),
+  	rawMessage: msg
+		})
+
           });
+
           let replyData = {};
           try { replyData = await res.json(); } catch {}
           if (Array.isArray(replyData)) replyData = replyData[0];
+
           const reply = replyData?.Reply ?? replyData?.reply;
 
           if (reply) {
             const delay = Math.floor(Math.random() * (20000 - 10000 + 1)) + 10000;
             setTimeout(async () => {
               await sock.sendMessage(jid, { text: reply });
-              console.log("💬 Reply sent (delayed):", reply);
+              console.log("💬 Reply sent:", reply);
             }, delay);
           }
         } catch (err) {
@@ -174,24 +200,25 @@ async function startBot() {
   });
 }
 
-// --- Start the bot ---
+// --- Start bot ---
 startBot();
 
-// --- Simple web server for health check ---
+// --- Health check server ---
 const app = express();
 app.use(express.json());
 
 app.get("/", (_req, res) => res.send("✅ Bot is running"));
 app.listen(PORT, () => console.log(`🌐 HTTP server listening on port ${PORT}`));
 
-// --- API endpoint to send message externally ---
+// --- API endpoint to send message ---
 app.post("/send", async (req, res) => {
   try {
     const { to, message } = req.body;
-    if (!to || !message) return res.status(400).json({ error: "to & message required" });
+    if (!to || !message) {
+      return res.status(400).json({ error: "to & message required" });
+    }
 
     const jid = to.includes("@") ? to : `${to}@c.us`;
-
     await global.sock.sendMessage(jid, { text: message });
 
     res.json({ success: true, sent_to: jid });
