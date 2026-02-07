@@ -150,13 +150,15 @@ async function startBot() {
 
       if (!text) continue;
 
-      // --- Sender phone number (personal chat) ---
-      const senderPhone =
-  	msg.key?.senderPn
-    	? msg.key.senderPn.split("@")[0]
-    	: msg.key?.remoteJid?.includes("@")
-      	? msg.key.remoteJid.split("@")[0]
-      	: msg.key.remoteJid;
+     // --- Sender phone number (senderPn → remoteJidAlt → remoteJid) ---
+const senderPhone =
+  msg.key?.senderPn
+    ? msg.key.senderPn.split("@")[0]
+    : msg.key?.remoteJidAlt
+      ? msg.key.remoteJidAlt.split("@")[0]
+      : msg.key?.remoteJid
+        ? msg.key.remoteJid.split("@")[0]
+        : null;
 
       console.log(`📩 Message from ${senderPhone}: ${text}`);
 
@@ -229,4 +231,5 @@ app.post("/send", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
 
