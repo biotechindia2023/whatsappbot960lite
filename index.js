@@ -135,6 +135,9 @@ async function startBot() {
       // ❌ Ignore group chats completely
       if (jid.endsWith("@g.us")) continue;
 
+	  // ❌ Ignore broadcasts (status, newsletter, etc.)
+		if (jid === "status@broadcast" || msg.message?.broadcast === true) continue;
+
       processedMessages.add(msgId);
       if (processedMessages.size > CACHE_LIMIT) {
         processedMessages.delete(processedMessages.values().next().value);
@@ -226,3 +229,4 @@ app.post("/send", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
