@@ -23,7 +23,7 @@ const CACHE_LIMIT = 500;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_KEY;
 const BUCKET_NAME = process.env.SUPABASE_BUCKET || "whatsapp-sessions";
-const CLIENT_ID = process.env.WHATSAPP_CLIENT_ID || "bot-478lite1";
+const CLIENT_ID = process.env.WHATSAPP_CLIENT_ID || "bot-960lite1";
 const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL || "";
 const PORT = process.env.PORT || 3000;
 
